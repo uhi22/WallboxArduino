@@ -508,6 +508,8 @@ void setup() {
 
 void readPoti(void) {
   uint16_t deltaI;
+
+  #ifdef USE_POTI_FOR_CHARGE_CURRENT_SELECTION
   nAdcPoti = analogRead(POTI_PIN);
   //globalTest = nAdcPoti / 4 / 5;
   if (nAdcPoti<512) {
@@ -518,6 +520,10 @@ void readPoti(void) {
     deltaI/=51; /* right side of poti, scaled 0 to 10 */
     I_Lade_Soll_A = 5 + deltaI; /* minimum value 5A, maximum 15A */
   }
+  #else
+    /* no poti for charge current selection, so we use fix value */
+    I_Lade_Soll_A = 16;
+  #endif  
   if (I_Lade_Soll_A != I_Lade_SollAlt_A) {
     I_Lade_SollAlt_A = I_Lade_Soll_A;
     if ((wallbox_state == WB_STATE_B) || (wallbox_state == WB_STATE_C)) {
