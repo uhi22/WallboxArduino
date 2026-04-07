@@ -13,4 +13,4 @@ Arduino Nano as simple wallbox controller
 ## References:
 
 * use case as simple PWM generator for pyPLC in EvseMode: https://github.com/uhi22/pyPLC/blob/master/hardware/plc_evse/plc_evse_schematic_v1.pdf
-* use case as replacement controller in the innogy/eon ebox
+* use case as replacement controller ("brain swap") in the innogy/eon ebox: https://hnng.de/eon-innogy-wallbox/
