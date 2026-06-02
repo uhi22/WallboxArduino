@@ -27,16 +27,6 @@
 // This is an array of leds.  One item for each led in your strip.
 CRGB leds[NUM_LEDS];
 
-uint16_t nLoop;
-
-void setLedStrip(uint32_t x) {
- uint8_t i;
- for(i = 0; i < NUM_LEDS; i++) {
-      leds[i] = x;
- }
- // Show the leds
- FastLED.show();
-}
 
 /***********************************************************************************/
 /* Global variables and definitions */
@@ -52,9 +42,10 @@ void setLedStrip(uint32_t x) {
 #define DEBUG_PIN 6         /* For debugging */
 
 #ifdef USE_CURRENT_CONTROL_VIA_PHOTO_RESISTOR
-#define PHOTO_PIN 0                /* Photo resistor on A0 */
-#define PHOTO_THRESHOLD_LOW  150   /* ADC counts below this = too dark, no charging */
-#define PHOTO_THRESHOLD_HIGH 800   /* ADC counts above this = full sun -> max current */
+#define PHOTO_PIN 5                /* Photo resistor on A5 */
+#define PHOTO_THRESHOLD_LOW        550   /* turn off below this. ADC counts below this = too dark, no charging */
+#define PHOTO_THRESHOLD_LOW_HYST   650   /* don't turn back on until above this */
+#define PHOTO_THRESHOLD_HIGH 920   /* ADC counts above this = full sun -> max current */
 #define SOLAR_I_MIN_A 6            /* Minimum charge current when just enough light */
 #define SOLAR_I_MAX_A 16           /* Maximum charge current at full sun */
 #endif
@@ -63,9 +54,42 @@ int8_t I_Lade_Soll_A = 0;
 int8_t I_Lade_SollAlt_A = -2;
 
 uint16_t nAdcPoti;
+uint32_t lastDemandedColor;
 
 #define PWM_FIVE_PERCENT (256/20); /* 5% of full range. */
 #define MAIN_LOOP_CYCLE_TIME_MS 20 /* 20 milliseconds main loop cycle time */
+
+/* IIR low-pass filter state for photo resistor (scaled by 1024 for integer math) */
+uint32_t nAdcPhotoFiltered_scaled = 0;
+#define PHOTO_FILTER_ALPHA_SCALED 4   /* alpha≈0.004, tau≈5s at 20ms cycle */
+
+/**************************************************************************/
+/*  LED control */
+
+void setLedStrip(uint32_t x) {
+ uint8_t i;
+ lastDemandedColor = x;
+ if (I_Lade_Soll_A == 0) {
+   /* if the target current is zero (no sun light), turn-off all LED lights, but keep one small yellow light */
+   for(i = 0; i < NUM_LEDS; i++) {
+      leds[i] = 0;
+   }
+   uint16_t nRed = 5 + (nAdcPhotoFiltered_scaled >> 10)>>2;
+   if (nRed>255) nRed=255;
+   uint16_t nGreen = nRed/2;
+   leds[1] = (((uint32_t)nRed)<<16) + (((uint32_t)nGreen)<<8);
+ } else {
+  /* normal case: set all LEDs to the requested color */
+   for(i = 0; i < NUM_LEDS; i++) {
+        leds[i] = x;
+   }
+ }
+ // Show the leds
+ FastLED.show();
+}
+
+
+
 
 /**********************************************************************************/
 /* Pilot signal generation and measurement */
@@ -265,12 +289,14 @@ void selftest(void) {
 #define T_TRANSITION_DEBOUNCE (250 / MAIN_LOOP_CYCLE_TIME_MS)             /* approx. 250 ms for normal state transitions */
 #define T_TRANSITION_DEBOUNCE_ERR_to_A (10000/MAIN_LOOP_CYCLE_TIME_MS)   /* approx. 10 seconds to transition from ERROR to Standby */
 #define T_TRANSITION_DEBOUNCE_A_B (200/MAIN_LOOP_CYCLE_TIME_MS)          /* approx. 200 ms from plug-in to activating PWM */
+#define T_TRANSITION_DEBOUNCE_LEAVINGC_TO_A (5000/MAIN_LOOP_CYCLE_TIME_MS) /* approx. 5s from CP=12V until we open the relay */
 
 #define WB_STATE_UNDEFINED 0 /* not initialised */
 #define WB_STATE_A 1         /* Standby */
 #define WB_STATE_B 2         /* vehicle detected */
 #define WB_STATE_C 3         /* ready/charging */
 #define WB_STATE_ERR 4       /* error */
+#define WB_STATE_LEAVING_C 5 /* intermediate state when we leave state C until we open the relay */
 
 
 uint8_t wallbox_state = WB_STATE_UNDEFINED;
@@ -281,6 +307,7 @@ uint16_t tTransitionDebounce_BC_A;
 uint16_t tTransitionDebounce_A_ERR;
 uint16_t tTransitionDebounce_BC_ERR;
 uint16_t tTransitionDebounce_ERR_A;
+uint16_t tTransitionDebounce_LeavingC_to_A;
 uint8_t printModulo;
 
 uint8_t checkTransition_A_B(void) {
@@ -320,6 +347,11 @@ uint8_t checkTransition_ERR_A(void) {
   return (tTransitionDebounce_ERR_A >= T_TRANSITION_DEBOUNCE_ERR_to_A);
 }
 
+uint8_t checkTransition_LEAVING_C_TO_A(void) {
+  tTransitionDebounce_LeavingC_to_A++; /* wait a fix time between turning CP to 12V, car ramping down the current until we open the relay */ 
+  return (tTransitionDebounce_LeavingC_to_A >= T_TRANSITION_DEBOUNCE_LEAVINGC_TO_A);
+}
+
 void resetAllTimers(void) {
   tTransitionDebounce_A_B=0;
   tTransitionDebounce_B_C=0;
@@ -328,6 +360,7 @@ void resetAllTimers(void) {
   tTransitionDebounce_A_ERR=0;
   tTransitionDebounce_BC_ERR=0;
   tTransitionDebounce_ERR_A=0;
+  tTransitionDebounce_LeavingC_to_A=0;
 }
 
 
@@ -381,6 +414,18 @@ void enterState_C(void) {
   wallbox_state = WB_STATE_C;
 }
 
+void enterState_leavingC(void) {
+  /* intermediate state, when we are leaving state C due to zero targetcurrent, and keep the relais on, until the car
+     ramped down the current */
+  Serial.println("Entering State leavingC");
+  m_Pilot.SetState(PILOT_STATE_P12);  /* +12V */
+  /* relay intentionally left on */
+  tTransitionDebounce_LeavingC_to_A = 0;
+  /* we do not set a new LED color here, because the last (blue for charging) is still valid, and the new
+     will be "dark mode" anyway, because we entered here because of missing sun. */
+  wallbox_state = WB_STATE_LEAVING_C;
+}
+
 void enterState_ERR(void) {
   /* Error */
   Serial.println("Entering State ERROR");
@@ -389,7 +434,7 @@ void enterState_ERR(void) {
   #endif  
   digitalWrite(CHARGING_PIN,LOW);
   digitalWrite(RED_LED_PIN,HIGH); 
-  setLedStrip(0x400000); /* RED */
+  setLedStrip(0x800000); /* RED */
   /* We could signal a fault to the vehicle here using -12V, but to avoid confusing it
    * we disable charging with a steady +12V, which should result in a stable and safe state.
    */
@@ -430,6 +475,9 @@ void runWbStateMachine(void) {
    case WB_STATE_ERR: /* error */
      if (checkTransition_ERR_A()) enterState_A();   
      break;
+   case WB_STATE_LEAVING_C: /* intermediate state when leaving C */
+     if (checkTransition_LEAVING_C_TO_A()) enterState_A();
+     break;
    default:
      enterState_A(); /* On init and if the state has unexpected values */
   }
@@ -456,13 +504,15 @@ void setup() {
   FastLED.addLeds<WS2811, DATA_PIN, RGB>(leds, NUM_LEDS);
   m_Pilot.Init(); // init the pilot
   setLedStrip(0x000000);
+  nAdcPhotoFiltered_scaled = (uint32_t)analogRead(PHOTO_PIN) << 10;  // warm-start filter
+
 }
 
 void readSolar(void) {
   uint16_t nAdcPhoto;
   int8_t newCurrent;
 
-  nAdcPhoto = analogRead(PHOTO_PIN);
+  nAdcPhoto = (uint16_t)(nAdcPhotoFiltered_scaled >> 10);
 
   if (nAdcPhoto < PHOTO_THRESHOLD_LOW) {
     /* Too dark — no solar power available, disable charging */
@@ -470,12 +520,15 @@ void readSolar(void) {
   } else if (nAdcPhoto >= PHOTO_THRESHOLD_HIGH) {
     /* Full sun — charge at maximum current */
     newCurrent = SOLAR_I_MAX_A;
-  } else {
+  } else if (nAdcPhoto >= PHOTO_THRESHOLD_LOW_HYST) {
     /* Linear interpolation between min and max current */
     uint16_t range    = PHOTO_THRESHOLD_HIGH - PHOTO_THRESHOLD_LOW;
     uint16_t aboveLow = nAdcPhoto - PHOTO_THRESHOLD_LOW;
     newCurrent = SOLAR_I_MIN_A
                + (int8_t)((uint16_t)(SOLAR_I_MAX_A - SOLAR_I_MIN_A) * aboveLow / range);
+  } else {
+    /* nAdcPhoto is in the hysteresis between PHOTO_THRESHOLD_LOW and PHOTO_THRESHOLD_LOW_HYST. Do not change anything. */
+    newCurrent = I_Lade_Soll_A;
   }
 
   /* Only act on changes */
@@ -488,8 +541,13 @@ void readSolar(void) {
 
     if (newCurrent == 0) {
       /* Sun gone — if we were charging, gracefully back to standby */
-      if ((wallbox_state == WB_STATE_B) || (wallbox_state == WB_STATE_C)) {
+      if (wallbox_state == WB_STATE_B) {
+        /* in state B the relais is not closed, so we can directly enter to state A (permanent 12V) without caring for relay-wait */
         enterState_A();
+      } else if (wallbox_state == WB_STATE_C) {
+        /* in state C, the relais is closed. We shall NOT open it, because this causes arcing and reduces lifetime.
+           Instead, we go to an intermediate state, where we stop the PWM but leave the relay closed. */
+        enterState_leavingC();
       }
     } else {
       /* Sun present — update PWM live if already in B or C */
@@ -533,11 +591,24 @@ void loop() {
   #ifdef USE_CURRENT_CONTROL_VIA_PHOTO_RESISTOR
     static uint16_t nLoop = 0;
     nLoop++;
-    if (nLoop > 100) { /* 100 x 20ms = 2s interval for printing the photo resistor ADC for calibration purposes */
+    if (nLoop > 100) {
+        Serial.print(F("Solar ADC="));
         Serial.println(analogRead(PHOTO_PIN));
         nLoop = 0;
     }
-    readSolar();
+
+    /* IIR low-pass filter — runs every 20ms loop cycle */
+    uint16_t nAdcPhotoRaw = analogRead(PHOTO_PIN);
+    nAdcPhotoFiltered_scaled += (uint32_t)PHOTO_FILTER_ALPHA_SCALED
+                              * ((uint32_t)nAdcPhotoRaw - (nAdcPhotoFiltered_scaled >> 10));
+
+    static uint16_t nSolarLoop = 0;
+    nSolarLoop++;
+    if (nSolarLoop >= 25) {       // 25 x 20ms = 0.5s
+        nSolarLoop = 0;
+        readSolar();               // uses filtered value, no ADC inside
+        setLedStrip(lastDemandedColor);
+    }
   #else
     readPoti();
   #endif

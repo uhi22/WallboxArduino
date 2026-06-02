@@ -9,6 +9,7 @@ Arduino Nano as simple wallbox controller
 * D10: PWM out for ControlPilot
 * D11: LED stripe WS2812
 * A1: ControlPilot feedback (56k to 5V, 100k to GND, 220k to CP.
+* A5: Photo resistor (to 5V, and 120k to ground) for sunlight-dependent charging
 
 ## References:
 
